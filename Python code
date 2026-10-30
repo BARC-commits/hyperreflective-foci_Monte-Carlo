@@ -1,601 +1,702 @@
+# ============================================================================
+# MONTE CARLO SIMULATION: HRF ETIOLOGY AS COMPETITIVE PROCESS
+# ============================================================================
+# Model:
+#   - MP burden per retina -> Poisson particle count (truncated lognormal
+#     diameter, Dirichlet-sampled polymer composition density)
+#   - Spatial congruence and optical match (possibly correlated)
+#   - Hierarchical patient -> eyes -> HRF structure with optional
+#     overdispersion on HRF count
+#   - Per-HRF probability of MP association via saturating binomial
+#     competition:
+#         p = (1 - f) * (1 - exp(-potential / hrf_count))
+#     capped at the biological ceiling (1 - f)
+# ============================================================================
+
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import lognorm, beta, poisson, norm, gaussian_kde
 
-# ============================================================================
-# MONTE CARLO SIMULATION: HRF ETIOLOGY AS COMPETITIVE PROCESS
-# ============================================================================
+try:
+    from IPython.display import Image, display as _ipy_display
+    _HAS_IPY = True
+except Exception:
+    _HAS_IPY = False
 
-# No random seed is set. Results will vary slightly between runs due to
-# random sampling. See Appendix B for the exact output values from the
-# simulation run used in this manuscript.
 
-print("="*60)
-print("MONTE CARLO SIMULATION")
-print("(Modeling MNP-HRF competition with non-MNP HRF)")
-print("="*60)
-print("NOTE: No random seed is set. Results will vary slightly between runs.")
-print("See Appendix B for the exact values from the simulation run used.")
-print()
+# ----------------------------------------------------------------------------
+# Reproducibility and output directory
+# ----------------------------------------------------------------------------
+SEED = 20261031
+RNG = np.random.default_rng(SEED)
+OUTDIR = Path("mp_hrf_outputs")
+OUTDIR.mkdir(exist_ok=True)
 
-# Set to 1,000,000 iterations for base simulation
-iterations = 1000000
+RETINA_MASS_G = 0.25
+HRF_PER_SCAN = 20
 
-print(f"Base Simulation Iterations: {iterations:,}")
-print()
+N_BASE = 1_000_000
+N_SCENARIO = 500_000
+N_DENSITY = 500_000
+N_SENSITIVITY = 200_000
 
-# 1. MNP Particle Count (from mass burden)
-# Zhang et al. (2025) reported 49.21 μg/g in retinal tissue
-particle_diameter_um = np.random.lognormal(mean=np.log(30), sigma=0.3, size=iterations)
-particle_volume_mm3 = (4/3) * np.pi * ((particle_diameter_um / 1000) / 2)**3
-particle_density_g_mm3 = 1.05 / 1000  # Polystyrene density
-mass_per_particle_g = particle_volume_mm3 * particle_density_g_mm3
-retina_mass_g = 0.25  # Approximate human retina mass
-total_mnp_mass_g = 49.21e-6 * retina_mass_g
-lambda_vector = total_mnp_mass_g / mass_per_particle_g
-particle_count = np.random.poisson(lam=lambda_vector)
 
-# 2. Spatial Congruence (C_spatial)
-# Probability that a particle is positioned to form an HRF
-# Beta(5,20) gives mean ~0.20, 95% range ~0.04-0.50
-c_spatial = np.random.beta(a=5, b=20, size=iterations)
+# ----------------------------------------------------------------------------
+# Polymer composition
+# ----------------------------------------------------------------------------
+POLYMERS = ["PS", "PE", "PET", "PP", "PVC"]
+POLYMER_DENSITIES_G_CM3 = np.array([1.05, 0.95, 1.38, 0.90, 1.40])
+POLYMER_ALPHA_UNIFORM = np.ones(len(POLYMERS))
 
-# 3. Optical Match Rate
-# Probability that a positioned particle generates an HRF signal
-# Beta(10,30) gives mean ~0.25, 95% range ~0.12-0.42
-optical_match = np.random.beta(a=10, b=30, size=iterations)
 
-# 4. Number of MNPs that could become HRF
-potential_mnp_hrf = particle_count * c_spatial * optical_match
+# ----------------------------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------------------------
+def save_and_show(fig, path):
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {path}")
+    if _HAS_IPY:
+        try:
+            _ipy_display(Image(filename=str(path)))
+        except Exception:
+            pass
 
-# 5. HRF Count (stratified by disease state)
-hrf_count_healthy = np.random.poisson(lam=2, size=iterations)
-hrf_count_dr = np.random.poisson(lam=20, size=iterations)
-hrf_count_amd = np.random.poisson(lam=30, size=iterations)
 
-# 6. Model HRF as "MNP-caused" vs "non-MNP-caused"
-# A baseline percentage of HRF are assumed to be non-MNP
-# (e.g., due to lipofuscin, macrophages, protein aggregates)
-# This baseline varies by disease state
+def truncated_lognormal(rng, size, median_um=30.0, sigma=0.3,
+                        lower_um=20.0, upper_um=50.0):
+    scale = median_um
+    lo = lognorm.cdf(lower_um, s=sigma, scale=scale)
+    hi = lognorm.cdf(upper_um, s=sigma, scale=scale)
+    u = rng.uniform(lo, hi, size=size)
+    return np.clip(lognorm.ppf(u, s=sigma, scale=scale), lower_um, upper_um)
 
-# Define baseline non-MNP HRF fraction (minimum % of HRF from other causes)
-non_mnp_fraction = {
-    'healthy': 0.70,  # At least 70% of HRF in healthy retina are non-MNP
-    'dr': 0.30,       # At least 30% of HRF in DR are non-MNP
-    'amd': 0.25       # At least 25% of HRF in AMD are non-MNP
-}
 
-def calculate_mnp_hrf(potential_mnp, hrf_count, non_mnp_fraction):
-    """Calculate MNP-associated HRF with non-MNP baseline"""
-    # Minimum number of non-MNP HRF (floor)
-    non_mnp_floor = non_mnp_fraction * hrf_count
-    
-    # Maximum number of MNP-associated HRF (ceiling)
-    max_mnp_hrf = hrf_count - non_mnp_floor
-    
-    # Actual MNP-associated HRF is the minimum of potential and ceiling
-    mnp_hrf = np.minimum(potential_mnp, max_mnp_hrf)
-    
-    # Ensure non-negative
-    mnp_hrf = np.maximum(mnp_hrf, 0)
-    
-    return mnp_hrf
+def sample_polymer_density(rng, size, alpha=None):
+    if alpha is None:
+        alpha = POLYMER_ALPHA_UNIFORM
+    w = rng.dirichlet(alpha, size=size)
+    return w @ POLYMER_DENSITIES_G_CM3
 
-# Calculate for each condition
-mnp_hrf_healthy = calculate_mnp_hrf(potential_mnp_hrf, hrf_count_healthy, non_mnp_fraction['healthy'])
-mnp_hrf_dr = calculate_mnp_hrf(potential_mnp_hrf, hrf_count_dr, non_mnp_fraction['dr'])
-mnp_hrf_amd = calculate_mnp_hrf(potential_mnp_hrf, hrf_count_amd, non_mnp_fraction['amd'])
 
-# 7. Calculate percentages
-percentage_healthy = (mnp_hrf_healthy / np.maximum(hrf_count_healthy, 1)) * 100
-percentage_dr = (mnp_hrf_dr / np.maximum(hrf_count_dr, 1)) * 100
-percentage_amd = (mnp_hrf_amd / np.maximum(hrf_count_amd, 1)) * 100
+def correlated_betas(rng, size, a1, b1, a2, b2, rho):
+    if rho == 0:
+        return rng.beta(a1, b1, size), rng.beta(a2, b2, size)
+    z = rng.multivariate_normal([0, 0], [[1, rho], [rho, 1]], size=size)
+    u = norm.cdf(z)
+    return beta.ppf(u[:, 0], a1, b1), beta.ppf(u[:, 1], a2, b2)
 
-# 8. Credible Intervals
-ci_healthy = np.percentile(percentage_healthy, [2.5, 97.5])
-ci_dr = np.percentile(percentage_dr, [2.5, 97.5])
-ci_amd = np.percentile(percentage_amd, [2.5, 97.5])
 
-print("BASE SIMULATION RESULTS (with non-MNP baseline):")
-print("-" * 50)
-print(f"Healthy Retina: Median = {np.median(percentage_healthy):.2f}%, 95% CI = [{ci_healthy[0]:.2f}, {ci_healthy[1]:.2f}]")
-print(f"Diabetic Retinopathy: Median = {np.median(percentage_dr):.2f}%, 95% CI = [{ci_dr[0]:.2f}, {ci_dr[1]:.2f}]")
-print(f"AMD: Median = {np.median(percentage_amd):.2f}%, 95% CI = [{ci_amd[0]:.2f}, {ci_amd[1]:.2f}]")
+def particle_count_from_mass(rng, size, mp_mass_ug_g, density_arr,
+                             lower_um=20.0, upper_um=50.0):
+    d_um = truncated_lognormal(rng, size, 30.0, 0.3, lower_um, upper_um)
+    r_mm = (d_um / 1000.0) / 2.0
+    v_mm3 = (4.0 / 3.0) * np.pi * r_mm ** 3
+    mass_per_particle_g = v_mm3 * (density_arr / 1000.0)
+    total_mass_g = mp_mass_ug_g * 1e-6 * RETINA_MASS_G
+    return rng.poisson(lam=total_mass_g / mass_per_particle_g)
 
-# ============================================================================
-# FIGURE 1: Base Simulation Results
-# ============================================================================
 
-fig1, ax1 = plt.subplots(figsize=(8, 6))
+def simulate_competition(
+    rng,
+    size,
+    mp_mass_ug_g,
+    c_spatial_params,
+    optical_params,
+    hrf_lambda,
+    non_mp_fraction,
+    eyes_per_patient=2,
+    overdispersion=0.3,
+    rho=0.0,
+    mixed_fraction=0.0,
+    lower_um=20.0,
+    upper_um=50.0,
+):
+    density_arr = sample_polymer_density(rng, size)
+    particle_count = particle_count_from_mass(
+        rng, size, mp_mass_ug_g, density_arr, lower_um, upper_um
+    )
 
-conditions = ['Healthy', 'Diabetic Retinopathy', 'AMD']
-medians = [np.median(percentage_healthy), np.median(percentage_dr), np.median(percentage_amd)]
-ci_lower = [ci_healthy[0], ci_dr[0], ci_amd[0]]
-ci_upper = [ci_healthy[1], ci_dr[1], ci_amd[1]]
+    c_sp, opt = correlated_betas(
+        rng, size,
+        c_spatial_params[0], c_spatial_params[1],
+        optical_params[0], optical_params[1],
+        rho,
+    )
+    potential_per_eye = particle_count * c_sp * opt
+    potential_total = potential_per_eye * eyes_per_patient
 
-# Calculate error bars (asymmetric)
-yerr_lower = [m - l for m, l in zip(medians, ci_lower)]
-yerr_upper = [u - m for m, u in zip(medians, ci_upper)]
+    lambda_eff = np.full(size, float(hrf_lambda) * eyes_per_patient)
+    if overdispersion > 0:
+        b = rng.normal(0.0, overdispersion, size=size)
+        lambda_eff = lambda_eff * np.exp(b)
+    hrf_count = np.maximum(rng.poisson(lam=lambda_eff), 1)
 
-bars = ax1.bar(conditions, medians, color=['#2ecc71', '#3498db', '#e74c3c'], 
-               alpha=0.7, edgecolor='black', linewidth=1.2)
-ax1.errorbar(conditions, medians, yerr=[yerr_lower, yerr_upper], 
-             fmt='none', capsize=8, color='black', linewidth=1.5)
+    ceiling = 1.0 - non_mp_fraction
+    supply_per_hrf = potential_total / hrf_count
+    p_mp = np.clip(ceiling * (1.0 - np.exp(-supply_per_hrf)), 0.0, 1.0)
 
-ax1.set_ylabel('MNP-Associated HRF (%)', fontsize=12)
-ax1.set_title('Base Simulation: Estimated Percentage of HRF Containing MNPs', fontsize=14)
-ax1.set_ylim(0, 100)
-ax1.grid(axis='y', alpha=0.3)
+    mp_hrf = rng.binomial(hrf_count, p_mp)
+    pct = 100.0 * mp_hrf / hrf_count
+    has_any = (mp_hrf >= 1)
 
-# Add value labels on bars
-for bar, median, ci_l, ci_u in zip(bars, medians, ci_lower, ci_upper):
-    height = bar.get_height()
-    ax1.annotate(f'{median:.1f}%\n[95% CI: {ci_l:.1f}-{ci_u:.1f}]',
-                 xy=(bar.get_x() + bar.get_width()/2, height),
-                 xytext=(0, 3),
-                 textcoords="offset points",
-                 ha='center', va='bottom', fontsize=9,
-                 color='black')
+    mixed = rng.binomial(hrf_count - mp_hrf, mixed_fraction)
+    pct_mixed = 100.0 * (mp_hrf + mixed) / hrf_count
 
-plt.tight_layout()
-plt.savefig('Figure1_Base_Simulation.png', dpi=300, bbox_inches='tight')
-print("\nFigure 1 saved: Figure1_Base_Simulation.png")
-
-# ============================================================================
-# SCENARIO ANALYSIS
-# ============================================================================
-
-print("\n")
-print("="*60)
-print("SCENARIO ANALYSIS (Diabetic Retinopathy)")
-print("="*60)
-print("Scenario Analysis Iterations: 500,000 each")
-
-def run_scenario(iterations, scenario_name, mnp_mass_ug_g, c_spatial_params, optical_match_params, 
-                 hrf_lambda=20, non_mnp_fraction=0.30):
-    """Run scenario analysis with non-MNP baseline"""
-    
-    # Particle count
-    particle_diameter_um = np.random.lognormal(mean=np.log(30), sigma=0.3, size=iterations)
-    particle_volume_mm3 = (4/3) * np.pi * ((particle_diameter_um / 1000) / 2)**3
-    mass_per_particle_g = particle_volume_mm3 * (1.05 / 1000)
-    total_mnp_mass_g = mnp_mass_ug_g * 1e-6 * 0.25
-    lambda_vector = total_mnp_mass_g / mass_per_particle_g
-    particle_count = np.random.poisson(lam=lambda_vector)
-    
-    # Other parameters
-    c_spatial = np.random.beta(a=c_spatial_params[0], b=c_spatial_params[1], size=iterations)
-    optical_match = np.random.beta(a=optical_match_params[0], b=optical_match_params[1], size=iterations)
-    
-    # Potential MNP-HRF
-    potential_mnp_hrf = particle_count * c_spatial * optical_match
-    
-    # HRF count
-    hrf_count = np.random.poisson(lam=hrf_lambda, size=iterations)
-    hrf_count = np.maximum(hrf_count, 1)
-    
-    # Calculate MNP-HRF with non-MNP baseline
-    non_mnp_floor = non_mnp_fraction * hrf_count
-    max_mnp_hrf = hrf_count - non_mnp_floor
-    mnp_hrf = np.minimum(potential_mnp_hrf, max_mnp_hrf)
-    mnp_hrf = np.maximum(mnp_hrf, 0)
-    
-    percentage = (mnp_hrf / hrf_count) * 100
-    
     return {
-        'scenario': scenario_name,
-        'percentage': percentage,
-        'median': np.median(percentage),
-        'ci_lower': np.percentile(percentage, 2.5),
-        'ci_upper': np.percentile(percentage, 97.5),
-        'mean': np.mean(percentage),
-        'std': np.std(percentage),
-        'pct_nonzero': np.mean(percentage > 0) * 100,
-        'pct_over_10': np.mean(percentage > 10) * 100,
-        'pct_over_30': np.mean(percentage > 30) * 100,
-        'pct_over_50': np.mean(percentage > 50) * 100
+        "percentage": pct,
+        "percentage_including_mixed": pct_mixed,
+        "has_any_mp": has_any,
+        "mp_hrf": mp_hrf,
+        "hrf_count": hrf_count,
+        "particle_count": particle_count,
+        "potential_mp_hrf": potential_total,
+        "p_mp": p_mp,
     }
 
-# Scenario definitions
-scenarios = [
-    {
-        'name': 'Conservative',
-        'mnp_mass_ug_g': 20.0,
-        'c_spatial': (3, 30),
-        'optical_match': (5, 50),
-        'non_mnp': 0.50
-    },
-    {
-        'name': 'Most Likely',
-        'mnp_mass_ug_g': 49.21,
-        'c_spatial': (5, 20),
-        'optical_match': (10, 30),
-        'non_mnp': 0.30
-    },
-    {
-        'name': 'Optimistic',
-        'mnp_mass_ug_g': 91.05,
-        'c_spatial': (10, 15),
-        'optical_match': (20, 20),
-        'non_mnp': 0.15
+
+def summarize(name, out, extra=None):
+    pct = np.asarray(out["percentage"])
+    p_mp = np.asarray(out["p_mp"])
+    has_any = np.asarray(out["has_any_mp"])
+    hrf_count = np.asarray(out["hrf_count"])
+    r = {
+        "name": name,
+        "n": int(pct.size),
+        "median_pct": float(np.median(pct)),
+        "mean_pct": float(np.mean(pct)),
+        "std_pct": float(np.std(pct)),
+        "pct_ci_lower": float(np.percentile(pct, 2.5)),
+        "pct_ci_upper": float(np.percentile(pct, 97.5)),
+        "mean_p_mp_pct": float(np.mean(p_mp) * 100.0),
+        "p_mp_ci_lower_pct": float(np.percentile(p_mp, 2.5) * 100.0),
+        "p_mp_ci_upper_pct": float(np.percentile(p_mp, 97.5) * 100.0),
+        "pct_patients_with_any_mp": float(np.mean(has_any) * 100.0),
+        "mean_hrf_count": float(np.mean(hrf_count)),
+        "pct_over_10": float(np.mean(pct > 10.0) * 100.0),
+        "pct_over_30": float(np.mean(pct > 30.0) * 100.0),
+        "pct_over_50": float(np.mean(pct > 50.0) * 100.0),
     }
+    if extra:
+        r.update(extra)
+    return r
+
+
+# ----------------------------------------------------------------------------
+# Base specification
+# ----------------------------------------------------------------------------
+base_specs = {
+    "Healthy": dict(
+        mp_mass_ug_g=49.21, c_spatial_params=(5, 20), optical_params=(10, 30),
+        hrf_lambda=2, non_mp_fraction=0.70,
+    ),
+    "Diabetic Retinopathy": dict(
+        mp_mass_ug_g=49.21, c_spatial_params=(5, 20), optical_params=(10, 30),
+        hrf_lambda=20, non_mp_fraction=0.30,
+    ),
+    "AMD": dict(
+        mp_mass_ug_g=49.21, c_spatial_params=(5, 20), optical_params=(10, 30),
+        hrf_lambda=30, non_mp_fraction=0.25,
+    ),
+}
+COLORS = {"Healthy": "#2ecc71", "Diabetic Retinopathy": "#3498db", "AMD": "#e74c3c"}
+
+
+# ----------------------------------------------------------------------------
+# 1. Base simulation
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("BASE SIMULATION")
+print("=" * 78)
+
+base_outputs = {}
+base_rows = []
+for name, spec in base_specs.items():
+    out = simulate_competition(RNG, N_BASE, **spec)
+    base_outputs[name] = out
+    base_rows.append(summarize(name, out))
+
+base_df = pd.DataFrame(base_rows)
+base_df.to_csv(OUTDIR / "base_simulation_results.csv", index=False)
+
+show_cols = ["name", "median_pct", "mean_pct",
+             "mean_p_mp_pct", "pct_patients_with_any_mp"]
+print(base_df[show_cols].round(2).to_string(index=False))
+print()
+
+
+# ----------------------------------------------------------------------------
+# Figure 1: Base simulation
+# ----------------------------------------------------------------------------
+fig1, ax1 = plt.subplots(figsize=(9, 6))
+conditions = list(base_specs.keys())
+x = np.arange(len(conditions))
+
+meds = [np.median(base_outputs[c]["percentage"]) for c in conditions]
+lo = [np.percentile(base_outputs[c]["percentage"], 2.5) for c in conditions]
+hi = [np.percentile(base_outputs[c]["percentage"], 97.5) for c in conditions]
+means = [np.mean(base_outputs[c]["percentage"]) for c in conditions]
+
+bars = ax1.bar(x, meds, color=[COLORS[c] for c in conditions],
+               alpha=0.7, edgecolor="black", linewidth=1.2, label="Median")
+ax1.errorbar(x, meds,
+             yerr=[[m - l for m, l in zip(meds, lo)],
+                   [u - m for m, u in zip(meds, hi)]],
+             fmt="none", capsize=8, color="black", linewidth=1.5,
+             label="95% CI")
+ax1.scatter(x, means, marker="D", s=60, color="black", zorder=5, label="Mean")
+
+for xi, m, l, u, mu in zip(x, meds, lo, hi, means):
+    ax1.annotate(
+        f"med {m:.1f}%\nmean {mu:.1f}%\n[{l:.1f}-{u:.1f}]",
+        xy=(xi, max(m, mu)), xytext=(0, 6),
+        textcoords="offset points", ha="center", va="bottom", fontsize=8,
+    )
+
+ax1.set_xticks(x)
+ax1.set_xticklabels(conditions, rotation=10)
+ax1.set_ylim(0, 105)
+ax1.set_ylabel("MP-Associated HRF (%)")
+ax1.set_title("Base Simulation: Percentage of HRF Containing MPs")
+ax1.grid(axis="y", alpha=0.3)
+ax1.legend(loc="upper right", fontsize=8)
+save_and_show(fig1, OUTDIR / "Figure1_Base_Simulation.png")
+
+
+# ----------------------------------------------------------------------------
+# 2. Scenario analysis
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("SCENARIO ANALYSIS: DIABETIC RETINOPATHY")
+print("=" * 78)
+
+scenarios = [
+    dict(name="Conservative", mp_mass_ug_g=20.0, c_spatial_params=(3, 30),
+         optical_params=(5, 50), hrf_lambda=20, non_mp_fraction=0.50),
+    dict(name="Most Likely", mp_mass_ug_g=49.21, c_spatial_params=(5, 20),
+         optical_params=(10, 30), hrf_lambda=20, non_mp_fraction=0.30),
+    dict(name="Optimistic", mp_mass_ug_g=91.05, c_spatial_params=(10, 15),
+         optical_params=(20, 20), hrf_lambda=20, non_mp_fraction=0.15),
 ]
 
-scenario_results = []
-for scenario in scenarios:
-    result = run_scenario(
-        500000, 
-        scenario['name'], 
-        scenario['mnp_mass_ug_g'],
-        scenario['c_spatial'],
-        scenario['optical_match'],
+scenario_outputs = {}
+scenario_rows = []
+for s in scenarios:
+    spec = {k: v for k, v in s.items() if k != "name"}
+    out = simulate_competition(RNG, N_SCENARIO, **spec)
+    scenario_outputs[s["name"]] = out
+    scenario_rows.append(summarize(s["name"], out))
+
+scenario_df = pd.DataFrame(scenario_rows)
+scenario_df.to_csv(OUTDIR / "scenario_analysis_results.csv", index=False)
+print(scenario_df[["name", "median_pct", "mean_pct",
+                   "mean_p_mp_pct", "pct_patients_with_any_mp"]]
+      .round(2).to_string(index=False))
+print()
+
+
+# ----------------------------------------------------------------------------
+# Figure 2: Scenario analysis
+# ----------------------------------------------------------------------------
+fig2, ax2 = plt.subplots(figsize=(9, 6))
+names = [r["name"] for r in scenario_rows]
+meds = [r["median_pct"] for r in scenario_rows]
+lo = [r["pct_ci_lower"] for r in scenario_rows]
+hi = [r["pct_ci_upper"] for r in scenario_rows]
+means = [r["mean_pct"] for r in scenario_rows]
+
+bars2 = ax2.bar(names, meds, color=["#f39c12", "#2ecc71", "#e74c3c"],
+                alpha=0.7, edgecolor="black", linewidth=1.2)
+ax2.errorbar(names, meds,
+             yerr=[[m - l for m, l in zip(meds, lo)],
+                   [u - m for m, u in zip(meds, hi)]],
+             fmt="none", capsize=8, color="black", linewidth=1.5)
+ax2.scatter(names, means, marker="D", s=60, color="black", zorder=5,
+            label="Mean")
+for xi, m, l, u, mu in zip(names, meds, lo, hi, means):
+    ax2.annotate(f"med {m:.1f}%\nmean {mu:.1f}%\n[{l:.1f}-{u:.1f}]",
+                 xy=(xi, max(m, mu)), xytext=(0, 6),
+                 textcoords="offset points", ha="center", va="bottom", fontsize=9)
+ax2.set_ylabel("MP-Associated HRF (%)")
+ax2.set_ylim(0, 105)
+ax2.set_title("Scenario Analysis: DR Retina")
+ax2.grid(axis="y", alpha=0.3)
+ax2.legend(loc="upper left")
+save_and_show(fig2, OUTDIR / "Figure2_Scenario_Analysis.png")
+
+
+# ----------------------------------------------------------------------------
+# 3. One-at-a-time sensitivity
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("SENSITIVITY ANALYSIS (ONE-AT-A-TIME)")
+print("=" * 78)
+
+BASE_DR = dict(mp_mass_ug_g=49.21, c_spatial_params=(5, 20),
+               optical_params=(10, 30), hrf_lambda=20, non_mp_fraction=0.30)
+
+baseline_out = simulate_competition(RNG, N_SENSITIVITY, **BASE_DR)
+baseline_median = float(np.median(baseline_out["percentage"]))
+print(f"Baseline DR median: {baseline_median:.2f}%")
+print()
+
+levels = {
+    "Non-MP Baseline": [("Low 0.15",  {"non_mp_fraction": 0.15}),
+                         ("High 0.50", {"non_mp_fraction": 0.50})],
+    "Optical Match":    [("Low Beta(5,50)",   {"optical_params": (5, 50)}),
+                         ("High Beta(20,20)", {"optical_params": (20, 20)})],
+    "MP Mass (ug/g)":  [("8.93",  {"mp_mass_ug_g": 8.93}),
+                         ("20.0",  {"mp_mass_ug_g": 20.0}),
+                         ("91.05", {"mp_mass_ug_g": 91.05})],
+    "Spatial Congruence": [("Low Beta(3,30)",   {"c_spatial_params": (3, 30)}),
+                           ("High Beta(10,15)", {"c_spatial_params": (10, 15)})],
+    "HRF Count (lambda)": [("Low 10",  {"hrf_lambda": 10}),
+                           ("High 30", {"hrf_lambda": 30})],
+}
+
+sens_rows = []
+for var, lvls in levels.items():
+    for lvl_label, over in lvls:
+        spec = {**BASE_DR, **over}
+        out = simulate_competition(RNG, N_SENSITIVITY, **spec)
+        med = float(np.median(out["percentage"]))
+        sens_rows.append(dict(
+            variable=var, level=lvl_label,
+            median_percentage=med,
+            deviation_from_baseline=med - baseline_median,
+        ))
+
+sens_df = pd.DataFrame(sens_rows)
+sens_df.to_csv(OUTDIR / "sensitivity_analysis_results.csv", index=False)
+print(sens_df.round(2).to_string(index=False))
+print()
+
+
+# ----------------------------------------------------------------------------
+# Figure 3: Tornado diagram
+# ----------------------------------------------------------------------------
+fig3, ax3 = plt.subplots(figsize=(11, 8))
+variable_order = ["Non-MP Baseline", "Optical Match", "MP Mass (ug/g)",
+                  "Spatial Congruence", "HRF Count (lambda)"]
+plot_df = (sens_df.assign(_o=sens_df["variable"].map({v: i for i, v in enumerate(variable_order)}))
+                 .sort_values(["_o", "median_percentage"])
+                 .iloc[::-1].reset_index(drop=True))
+
+for i, row in plot_df.iterrows():
+    val = row["median_percentage"]
+    dev = row["deviation_from_baseline"]
+    left = min(val, baseline_median)
+    width = max(abs(val - baseline_median), 0.05)
+    color = "#e74c3c" if dev < 0 else "#2ecc71" if dev > 0 else "#95a5a6"
+    ax3.barh(i, width, left=left, color=color, alpha=0.7,
+             edgecolor="black", linewidth=0.8, height=0.6)
+    ha = "left" if dev >= 0 else "right"
+    ax3.text(val + (0.8 if dev >= 0 else -0.8), i,
+             f"{val:.1f}% (delta {dev:+.1f})", va="center", ha=ha, fontsize=8)
+
+ax3.axvline(baseline_median, color="black", linestyle="--", linewidth=2,
+            label=f"Baseline {baseline_median:.1f}%")
+ax3.set_yticks(np.arange(len(plot_df)))
+ax3.set_yticklabels([f"{r.variable}\n{r.level}" for r in plot_df.itertuples()],
+                    fontsize=8)
+ax3.set_xlabel("MP-Associated HRF (%)")
+ax3.set_title("Tornado Diagram: One-at-a-Time Sensitivity (DR)")
+ax3.legend(loc="lower right")
+ax3.grid(axis="x", alpha=0.3)
+x_min = min(plot_df["median_percentage"].min(), baseline_median) - 8
+x_max = max(plot_df["median_percentage"].max(), baseline_median) + 8
+ax3.set_xlim(max(0, x_min), min(100, x_max))
+save_and_show(fig3, OUTDIR / "Figure3_Tornado_Diagram.png")
+
+
+# ----------------------------------------------------------------------------
+# 4. Correlation sensitivity
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("CORRELATION SENSITIVITY (spatial congruence vs optical match)")
+print("=" * 78)
+
+rho_values = [-0.30, -0.15, 0.0, 0.15, 0.30, 0.60]
+rho_rows = []
+for rho in rho_values:
+    out = simulate_competition(RNG, N_SENSITIVITY, **BASE_DR, rho=rho)
+    rho_rows.append(dict(
+        rho=rho,
+        median=float(np.median(out["percentage"])),
+        mean=float(np.mean(out["percentage"])),
+        mean_p_mp_pct=float(np.mean(out["p_mp"]) * 100.0),
+    ))
+rho_df = pd.DataFrame(rho_rows)
+rho_df.to_csv(OUTDIR / "correlation_sensitivity.csv", index=False)
+print(rho_df.round(2).to_string(index=False))
+print()
+
+
+# ----------------------------------------------------------------------------
+# 5. Polymer composition sensitivity
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("POLYMER COMPOSITION SENSITIVITY")
+print("=" * 78)
+
+composition_priors = {
+    "Uniform Dirichlet(1,1,1,1,1)": np.ones(5),
+    "PS/PET-emphasised Dirichlet(3,1,3,1,2)": np.array([3, 1, 3, 1, 2]),
+    "PE/PP-emphasised Dirichlet(1,3,1,3,2)": np.array([1, 3, 1, 3, 2]),
+    "Fixed PS 1.05 g/cm3": "fixed",
+}
+
+comp_rows = []
+for name, alpha in composition_priors.items():
+    if isinstance(alpha, str) and alpha == "fixed":
+        def sample_fixed(rng, size):
+            return np.full(size, 1.05)
+    else:
+        def sample_fixed(rng, size, _a=alpha):
+            w = rng.dirichlet(_a, size=size)
+            return w @ POLYMER_DENSITIES_G_CM3
+
+    original = sample_polymer_density
+    globals()["sample_polymer_density"] = sample_fixed
+    try:
+        out = simulate_competition(RNG, N_SENSITIVITY, **BASE_DR)
+        comp_rows.append(dict(
+            prior=name,
+            median=float(np.median(out["percentage"])),
+            mean_p_mp_pct=float(np.mean(out["p_mp"]) * 100.0),
+        ))
+    finally:
+        globals()["sample_polymer_density"] = original
+
+comp_df = pd.DataFrame(comp_rows)
+comp_df.to_csv(OUTDIR / "polymer_composition_sensitivity.csv", index=False)
+print(comp_df.round(2).to_string(index=False))
+print()
+
+
+# ----------------------------------------------------------------------------
+# 6. Prior sensitivity
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("PRIOR SENSITIVITY (spatial congruence and optical match)")
+print("=" * 78)
+
+prior_sets = {
+    "Reference (5,20) / (10,30)":   ((5, 20), (10, 30)),
+    "Wide-low (2,8) / (5,15)":      ((2, 8), (5, 15)),
+    "Wide-high (10,30) / (20,40)":  ((10, 30), (20, 40)),
+    "Uniform (1,1) / (1,1)":        ((1, 1), (1, 1)),
+}
+
+prior_rows = []
+for label, (c_params, o_params) in prior_sets.items():
+    out = simulate_competition(
+        RNG, N_SENSITIVITY,
+        mp_mass_ug_g=49.21,
+        c_spatial_params=c_params,
+        optical_params=o_params,
         hrf_lambda=20,
-        non_mnp_fraction=scenario['non_mnp']
+        non_mp_fraction=0.30,
     )
-    scenario_results.append(result)
-    print(f"\n{result['scenario']} Scenario:")
-    print(f"  Median: {result['median']:.2f}%")
-    print(f"  95% CI: [{result['ci_lower']:.2f}, {result['ci_upper']:.2f}]")
-    print(f"  Mean: {result['mean']:.2f}% ± {result['std']:.2f}%")
-    print(f"  Percent of simulations with non-zero estimate: {result['pct_nonzero']:.1f}%")
-    print(f"  Percent with >10% MNP-HRF: {result['pct_over_10']:.1f}%")
-    print(f"  Percent with >30% MNP-HRF: {result['pct_over_30']:.1f}%")
-    print(f"  Percent with >50% MNP-HRF: {result['pct_over_50']:.1f}%")
+    prior_rows.append(dict(
+        prior=label,
+        median=float(np.median(out["percentage"])),
+        mean_p_mp_pct=float(np.mean(out["p_mp"]) * 100.0),
+    ))
+prior_df = pd.DataFrame(prior_rows)
+prior_df.to_csv(OUTDIR / "prior_sensitivity.csv", index=False)
+print(prior_df.round(2).to_string(index=False))
+print()
 
-# ============================================================================
-# FIGURE 2: Scenario Analysis
-# ============================================================================
 
-fig2, ax2 = plt.subplots(figsize=(10, 6))
+# ----------------------------------------------------------------------------
+# 7. Mixed-HRF fraction sensitivity
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("MIXED-HRF FRACTION SENSITIVITY")
+print("=" * 78)
 
-scenario_names = [r['scenario'] for r in scenario_results]
-scenario_medians = [r['median'] for r in scenario_results]
-scenario_ci_lower = [r['ci_lower'] for r in scenario_results]
-scenario_ci_upper = [r['ci_upper'] for r in scenario_results]
+mixed_rows = []
+for frac in [0.0, 0.05, 0.10, 0.20, 0.30]:
+    out = simulate_competition(RNG, N_SENSITIVITY, **BASE_DR,
+                               mixed_fraction=frac)
+    mixed_rows.append(dict(
+        mixed_fraction=frac,
+        median_strict=float(np.median(out["percentage"])),
+        median_including_mixed=float(np.median(out["percentage_including_mixed"])),
+        mean_strict=float(np.mean(out["percentage"])),
+        mean_including_mixed=float(np.mean(out["percentage_including_mixed"])),
+    ))
+mixed_df = pd.DataFrame(mixed_rows)
+mixed_df.to_csv(OUTDIR / "model_structure_sensitivity.csv", index=False)
+print(mixed_df.round(2).to_string(index=False))
+print()
 
-# Error bars
-yerr_lower_s = [m - l for m, l in zip(scenario_medians, scenario_ci_lower)]
-yerr_upper_s = [u - m for m, u in zip(scenario_medians, scenario_ci_upper)]
 
-colors = ['#f39c12', '#2ecc71', '#e74c3c']
-bars2 = ax2.bar(scenario_names, scenario_medians, color=colors, 
-                alpha=0.7, edgecolor='black', linewidth=1.2)
-ax2.errorbar(scenario_names, scenario_medians, yerr=[yerr_lower_s, yerr_upper_s],
-             fmt='none', capsize=8, color='black', linewidth=1.5)
-
-ax2.set_ylabel('MNP-Associated HRF (%)', fontsize=12)
-ax2.set_title('Scenario Analysis: DR Retina', fontsize=14)
-ax2.set_ylim(0, 100)
-ax2.grid(axis='y', alpha=0.3)
-
-# Add value labels
-for bar, median, ci_l, ci_u in zip(bars2, scenario_medians, scenario_ci_lower, scenario_ci_upper):
-    height = bar.get_height()
-    ax2.annotate(f'{median:.1f}%\n[95% CI: {ci_l:.1f}-{ci_u:.1f}]',
-                 xy=(bar.get_x() + bar.get_width()/2, height),
-                 xytext=(0, 3),
-                 textcoords="offset points",
-                 ha='center', va='bottom', fontsize=9,
-                 color='black')
-
-plt.tight_layout()
-plt.savefig('Figure2_Scenario_Analysis.png', dpi=300, bbox_inches='tight')
-print("\nFigure 2 saved: Figure2_Scenario_Analysis.png")
-
-# ============================================================================
-# FIGURE 3: Tornado Diagram
-# ============================================================================
-
-fig3, ax3 = plt.subplots(figsize=(10, 8))
-
-# Define the correct order: Non-MNP Baseline first, then Optical Match, then others
-# We use [[::-1]] to reverse it so the top items appear at the top of the horizontal bar chart
-correct_order = ['Non-MNP Baseline', 'Optical Match (mean)', 'MNP Mass (μg/g)', 
-                 'Spatial Congruence (mean)', 'HRF Count (λ)'][::-1]
-
-# Prepare data for tornado diagram
-tornado_data = []
-for var_name in correct_order:
-    # Get rows for this variable
-    var_rows = results_sorted[results_sorted['variable'] == var_name]
-    for idx, row in var_rows.iterrows():
-        if row['deviation_from_baseline'] < 0:
-            bar_start = row['median_percentage']
-            bar_end = baseline_median
-            bar_color = '#e74c3c'
-        elif row['deviation_from_baseline'] > 0:
-            bar_start = baseline_median
-            bar_end = row['median_percentage']
-            bar_color = '#2ecc71'
-        else:
-            bar_start = baseline_median - 0.5
-            bar_end = baseline_median + 0.5
-            bar_color = '#95a5a6'
-        
-        # Create label
-        if row['deviation_from_baseline'] < 0:
-            label = f"{row['variable']}\n{row['level']} ({row['median_percentage']:.2f}%, Δ = {row['deviation_from_baseline']:.2f}%)"
-        elif row['deviation_from_baseline'] > 0:
-            label = f"{row['variable']}\n{row['level']} ({row['median_percentage']:.2f}%, Δ = +{row['deviation_from_baseline']:.2f}%)"
-        else:
-            label = f"{row['variable']}\n{row['level']} (70.0%)"
-        
-        tornado_data.append({
-            'label': label,
-            'start': bar_start,
-            'end': bar_end,
-            'color': bar_color,
-            'deviation': row['deviation_from_baseline'],
-            'value': row['median_percentage']
-        })
-
-# Create horizontal bar chart
-y_pos = np.arange(len(tornado_data))
-labels = [d['label'] for d in tornado_data]
-starts = [d['start'] for d in tornado_data]
-ends = [d['end'] for d in tornado_data]
-widths = [end - start for start, end in zip(starts, ends)]
-colors_tornado = [d['color'] for d in tornado_data]
-values = [d['value'] for d in tornado_data]
-deviations = [d['deviation'] for d in tornado_data]
-
-# Plot bars
-bars3 = ax3.barh(y_pos, widths, left=starts, color=colors_tornado, 
-                 alpha=0.7, edgecolor='black', linewidth=0.8, height=0.6)
-
-# Add vertical line at baseline
-ax3.axvline(x=baseline_median, color='black', linestyle='--', linewidth=2, 
-           label=f'Baseline: {baseline_median:.1f}%')
-
-ax3.set_yticks(y_pos)
-ax3.set_yticklabels(labels, fontsize=9)
-ax3.set_xlabel('MNP-Associated HRF (%)', fontsize=12)
-ax3.set_title('Tornado Diagram: Sensitivity Analysis', fontsize=14)
-
-# Set x-axis limits with padding
-x_min = min([s for s in starts if s > 0]) - 8
-x_max = max([e for e in ends if e < 100]) + 8
-ax3.set_xlim(x_min, x_max)
-
-# Add value annotations
-for i, (d, dev, val, start, end) in enumerate(zip(tornado_data, deviations, values, starts, ends)):
-    if dev < 0:
-        ax3.annotate(f'{val:.2f}%', 
-                    xy=(start - 0.8, i), 
-                    va='center', ha='right', fontsize=8, color='black')
-        ax3.annotate(f'Δ = {dev:.2f}%', 
-                    xy=(baseline_median + 1.5, i), 
-                    va='center', ha='left', fontsize=7, color='black')
-    elif dev > 0:
-        ax3.annotate(f'{val:.2f}%', 
-                    xy=(end + 0.8, i), 
-                    va='center', ha='left', fontsize=8, color='black')
-        ax3.annotate(f'Δ = +{dev:.2f}%', 
-                    xy=(baseline_median - 1.5, i), 
-                    va='center', ha='right', fontsize=7, color='black')
-    else:
-        ax3.annotate(f'{val:.1f}%', 
-                    xy=(baseline_median, i), 
-                    va='center', ha='center', fontsize=8, color='black')
-
-ax3.legend(loc='lower right')
-plt.tight_layout()
-plt.savefig('Figure3_Tornado_Diagram.png', dpi=300, bbox_inches='tight')
-print("\nFigure 3 saved: Figure3_Tornado_Diagram.png")
-
-# ============================================================================
-# PROBABILITY DENSITY CURVES
-# ============================================================================
-
-print("\n")
-print("="*60)
+# ----------------------------------------------------------------------------
+# 8. Density distributions
+# ----------------------------------------------------------------------------
+print("=" * 78)
 print("PROBABILITY DENSITY DISTRIBUTIONS")
-print("="*60)
+print("=" * 78)
 
-# Generate density data for plotting (using 500,000 iterations each)
-def get_density_data(iterations, mnp_mass_ug_g, c_spatial_params, optical_match_params, 
-                     hrf_lambda, non_mnp_fraction):
-    """Generate percentage data for density plotting"""
-    
-    # Particle count
-    particle_diameter_um = np.random.lognormal(mean=np.log(30), sigma=0.3, size=iterations)
-    particle_volume_mm3 = (4/3) * np.pi * ((particle_diameter_um / 1000) / 2)**3
-    mass_per_particle_g = particle_volume_mm3 * (1.05 / 1000)
-    total_mnp_mass_g = mnp_mass_ug_g * 1e-6 * 0.25
-    lambda_vector = total_mnp_mass_g / mass_per_particle_g
-    particle_count = np.random.poisson(lam=lambda_vector)
-    
-    # Other parameters
-    c_spatial = np.random.beta(a=c_spatial_params[0], b=c_spatial_params[1], size=iterations)
-    optical_match = np.random.beta(a=optical_match_params[0], b=optical_match_params[1], size=iterations)
-    
-    # Potential MNP-HRF
-    potential_mnp_hrf = particle_count * c_spatial * optical_match
-    
-    # HRF count
-    hrf_count = np.random.poisson(lam=hrf_lambda, size=iterations)
-    hrf_count = np.maximum(hrf_count, 1)
-    
-    # Calculate MNP-HRF with non-MNP baseline
-    non_mnp_floor = non_mnp_fraction * hrf_count
-    max_mnp_hrf = hrf_count - non_mnp_floor
-    mnp_hrf = np.minimum(potential_mnp_hrf, max_mnp_hrf)
-    mnp_hrf = np.maximum(mnp_hrf, 0)
-    
-    return (mnp_hrf / hrf_count) * 100
+density_frames = {}
+density_rows = []
 
-# Generate density data for each condition
-density_healthy = get_density_data(500000, 49.21, (5, 20), (10, 30), 2, 0.70)
-density_dr = get_density_data(500000, 49.21, (5, 20), (10, 30), 20, 0.30)
-density_amd = get_density_data(500000, 49.21, (5, 20), (10, 30), 30, 0.25)
+for name, spec in base_specs.items():
+    out = simulate_competition(RNG, N_DENSITY, **spec)
+    density_frames[name] = out["percentage"]
+    density_rows.append(summarize(name, out, extra={"panel": "disease"}))
 
-# Also generate for scenarios (DR)
-density_conservative = get_density_data(500000, 20.0, (3, 30), (5, 50), 20, 0.50)
-density_most_likely = get_density_data(500000, 49.21, (5, 20), (10, 30), 20, 0.30)
-density_optimistic = get_density_data(500000, 91.05, (10, 15), (20, 20), 20, 0.15)
+for s in scenarios:
+    spec = {k: v for k, v in s.items() if k != "name"}
+    out = simulate_competition(RNG, N_DENSITY, **spec)
+    density_frames[s["name"]] = out["percentage"]
+    density_rows.append(summarize(s["name"], out, extra={"panel": "scenario"}))
 
-print("Density data generated for plotting:")
-print(f"  Healthy: n={len(density_healthy):,}, median={np.median(density_healthy):.2f}%")
-print(f"  DR: n={len(density_dr):,}, median={np.median(density_dr):.2f}%")
-print(f"  AMD: n={len(density_amd):,}, median={np.median(density_amd):.2f}%")
-print(f"  Conservative (DR): n={len(density_conservative):,}, median={np.median(density_conservative):.2f}%")
-print(f"  Most Likely (DR): n={len(density_most_likely):,}, median={np.median(density_most_likely):.2f}%")
-print(f"  Optimistic (DR): n={len(density_optimistic):,}, median={np.median(density_optimistic):.2f}%")
+density_df = pd.DataFrame(density_rows)
+density_df.to_csv(OUTDIR / "density_summary.csv", index=False)
+print(density_df[["name", "median_pct", "mean_pct", "mean_p_mp_pct"]]
+      .round(2).to_string(index=False))
+print()
 
-# ============================================================================
-# FIGURE 4: Probability Density Curves
-# ============================================================================
 
-fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(14, 6))
+# ----------------------------------------------------------------------------
+# Figure 4: Density curves
+# ----------------------------------------------------------------------------
+fig4, (axA, axB) = plt.subplots(1, 2, figsize=(14, 6))
+x_rng = np.linspace(0, 100, 1000)
 
-# Generate x-axis range for KDE
-x_range = np.linspace(0, 100, 1000)
+for key, lab, col in [("Healthy", "Healthy", "#2ecc71"),
+                      ("Diabetic Retinopathy", "DR", "#3498db"),
+                      ("AMD", "AMD", "#e74c3c")]:
+    k = gaussian_kde(density_frames[key])
+    axA.plot(x_rng, k(x_rng), color=col, lw=2, label=lab)
+    axA.fill_between(x_rng, 0, k(x_rng), color=col, alpha=0.3)
+    axA.axvline(np.median(density_frames[key]), color=col, ls="--", lw=1.5, alpha=0.7)
+axA.set_xlim(0, 100)
+axA.set_xlabel("MP-Associated HRF (%)")
+axA.set_ylabel("Probability Density")
+axA.set_title("Density Distribution by Disease State")
+axA.legend()
+axA.grid(alpha=0.3)
 
-# Subplot A: Disease states (Healthy, DR, AMD)
-kde_healthy = gaussian_kde(density_healthy)
-ax4a.plot(x_range, kde_healthy(x_range), label='Healthy', color='#2ecc71', linewidth=2)
-ax4a.fill_between(x_range, 0, kde_healthy(x_range), alpha=0.3, color='#2ecc71')
+for key, lab, col in [("Conservative", "Conservative", "#f39c12"),
+                      ("Most Likely", "Most Likely", "#2ecc71"),
+                      ("Optimistic", "Optimistic", "#e74c3c")]:
+    k = gaussian_kde(density_frames[key])
+    axB.plot(x_rng, k(x_rng), color=col, lw=2, label=lab)
+    axB.fill_between(x_rng, 0, k(x_rng), color=col, alpha=0.3)
+    axB.axvline(np.median(density_frames[key]), color=col, ls="--", lw=1.5, alpha=0.7)
+axB.set_xlim(0, 100)
+axB.set_xlabel("MP-Associated HRF (%)")
+axB.set_ylabel("Probability Density")
+axB.set_title("Density Distribution: DR Scenarios")
+axB.legend()
+axB.grid(alpha=0.3)
+save_and_show(fig4, OUTDIR / "Figure4_Density_Curves.png")
 
-kde_dr = gaussian_kde(density_dr)
-ax4a.plot(x_range, kde_dr(x_range), label='DR', color='#3498db', linewidth=2)
-ax4a.fill_between(x_range, 0, kde_dr(x_range), alpha=0.3, color='#3498db')
 
-kde_amd = gaussian_kde(density_amd)
-ax4a.plot(x_range, kde_amd(x_range), label='AMD', color='#e74c3c', linewidth=2)
-ax4a.fill_between(x_range, 0, kde_amd(x_range), alpha=0.3, color='#e74c3c')
+# ----------------------------------------------------------------------------
+# 9. Sample size
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("SAMPLE SIZE CALCULATION")
+print("=" * 78)
 
-# Add vertical lines for medians
-med_healthy = np.median(density_healthy)
-med_dr = np.median(density_dr)
-med_amd = np.median(density_amd)
 
-ax4a.axvline(med_healthy, color='#2ecc71', linestyle='--', linewidth=1.5, alpha=0.7)
-ax4a.axvline(med_dr, color='#3498db', linestyle='--', linewidth=1.5, alpha=0.7)
-ax4a.axvline(med_amd, color='#e74c3c', linestyle='--', linewidth=1.5, alpha=0.7)
+def n_for(conf, p):
+    if p <= 0:
+        return np.inf
+    if p >= 1:
+        return 1.0
+    return float(np.log(1.0 - conf) / np.log(1.0 - p))
 
-# Annotate medians - DR on left, AMD on right to avoid overlap
-ax4a.text(med_healthy + 1, 0.018, f'Median: {med_healthy:.1f}%', color='black', fontsize=8, va='bottom')
-ax4a.text(med_dr - 6, 0.013, f'Median: {med_dr:.1f}%', color='black', fontsize=8, va='bottom', ha='right')
-ax4a.text(med_amd + 1, 0.008, f'Median: {med_amd:.1f}%', color='black', fontsize=8, va='bottom', ha='left')
 
-ax4a.set_xlabel('MNP-Associated HRF (%)', fontsize=12)
-ax4a.set_ylabel('Probability Density', fontsize=12)
-ax4a.set_title('Density Distribution by Disease State', fontsize=14)
-ax4a.set_xlim(0, 100)
-ax4a.legend()
-ax4a.grid(alpha=0.3)
+p_hrf_most_likely = float(np.mean(scenario_outputs["Most Likely"]["p_mp"]))
+p_hrf_conservative = float(np.mean(scenario_outputs["Conservative"]["p_mp"]))
+p_patient_most_likely = float(np.mean(scenario_outputs["Most Likely"]["has_any_mp"]))
+p_patient_conservative = float(np.mean(scenario_outputs["Conservative"]["has_any_mp"]))
 
-# Subplot B: DR Scenarios (Conservative, Most Likely, Optimistic)
-kde_conservative = gaussian_kde(density_conservative)
-ax4b.plot(x_range, kde_conservative(x_range), label='Conservative', color='#f39c12', linewidth=2)
-ax4b.fill_between(x_range, 0, kde_conservative(x_range), alpha=0.3, color='#f39c12')
+print(f"Per-HRF p(MP | HRF):  Most Likely = {p_hrf_most_likely:.4f}, "
+      f"Conservative = {p_hrf_conservative:.4f}")
+print(f"Per-patient P(>=1 MP-HRF): Most Likely = {p_patient_most_likely:.4f}, "
+      f"Conservative = {p_patient_conservative:.4f}")
+print()
 
-kde_most_likely = gaussian_kde(density_most_likely)
-ax4b.plot(x_range, kde_most_likely(x_range), label='Most Likely', color='#2ecc71', linewidth=2)
-ax4b.fill_between(x_range, 0, kde_most_likely(x_range), alpha=0.3, color='#2ecc71')
+sample_rows = []
+for scen_label, p_hrf, p_pat in [
+    ("Most Likely", p_hrf_most_likely, p_patient_most_likely),
+    ("Conservative", p_hrf_conservative, p_patient_conservative),
+]:
+    for conf in [0.80, 0.90, 0.95]:
+        n_hrf = n_for(conf, p_hrf)
+        n_patient = n_for(conf, p_pat)
+        sample_rows.append(dict(
+            scenario=scen_label,
+            confidence=conf,
+            n_hrf=int(np.ceil(n_hrf)) if np.isfinite(n_hrf) else -1,
+            raw_scan_equiv=n_hrf / HRF_PER_SCAN if np.isfinite(n_hrf) else -1,
+            b_scans_ceiling=int(np.ceil(n_hrf / HRF_PER_SCAN)) if np.isfinite(n_hrf) else -1,
+            n_patients=int(np.ceil(n_patient)) if np.isfinite(n_patient) else -1,
+        ))
+sample_df = pd.DataFrame(sample_rows)
+sample_df.to_csv(OUTDIR / "sample_size_results.csv", index=False)
+print(sample_df.round(3).to_string(index=False))
+print()
 
-kde_optimistic = gaussian_kde(density_optimistic)
-ax4b.plot(x_range, kde_optimistic(x_range), label='Optimistic', color='#e74c3c', linewidth=2)
-ax4b.fill_between(x_range, 0, kde_optimistic(x_range), alpha=0.3, color='#e74c3c')
 
-# Add vertical lines for medians
-med_conservative = np.median(density_conservative)
-med_most_likely = np.median(density_most_likely)
-med_optimistic = np.median(density_optimistic)
+# ----------------------------------------------------------------------------
+# 10. Clustering design-effect sensitivity
+# ----------------------------------------------------------------------------
+print("=" * 78)
+print("CLUSTERING DESIGN-EFFECT SENSITIVITY")
+print("=" * 78)
 
-ax4b.axvline(med_conservative, color='#f39c12', linestyle='--', linewidth=1.5, alpha=0.7)
-ax4b.axvline(med_most_likely, color='#2ecc71', linestyle='--', linewidth=1.5, alpha=0.7)
-ax4b.axvline(med_optimistic, color='#e74c3c', linestyle='--', linewidth=1.5, alpha=0.7)
+cluster_rows = []
+for icc in [0.05, 0.10, 0.20]:
+    for k in [5, 10, 20]:
+        deff = 1.0 + (k - 1.0) * icc
+        n_ind = n_for(0.95, p_hrf_most_likely)
+        cluster_rows.append(dict(
+            icc=icc,
+            hrf_per_cluster=k,
+            design_effect=deff,
+            n_hrf_independent_95pct=int(np.ceil(n_ind)),
+            n_hrf_adjusted_95pct=int(np.ceil(n_ind * deff)),
+        ))
+cluster_df = pd.DataFrame(cluster_rows)
+cluster_df.to_csv(OUTDIR / "clustering_sample_size_sensitivity.csv", index=False)
+print(cluster_df.round(2).to_string(index=False))
+print()
 
-# Annotate medians - staggered vertically
-ax4b.text(med_conservative + 1, 0.028, f'Median: {med_conservative:.1f}%', color='black', fontsize=8, va='bottom')
-ax4b.text(med_most_likely + 1, 0.020, f'Median: {med_most_likely:.1f}%', color='black', fontsize=8, va='bottom')
-ax4b.text(med_optimistic + 1, 0.012, f'Median: {med_optimistic:.1f}%', color='black', fontsize=8, va='bottom')
 
-ax4b.set_xlabel('MNP-Associated HRF (%)', fontsize=12)
-ax4b.set_ylabel('Probability Density', fontsize=12)
-ax4b.set_title('Density Distribution: DR Scenarios', fontsize=14)
-ax4b.set_xlim(0, 100)
-ax4b.legend()
-ax4b.grid(alpha=0.3)
+# ----------------------------------------------------------------------------
+# 11. Save metadata
+# ----------------------------------------------------------------------------
+metadata = {
+    "seed": SEED,
+    "N_base": N_BASE,
+    "N_scenario": N_SCENARIO,
+    "N_density": N_DENSITY,
+    "N_sensitivity": N_SENSITIVITY,
+    "polymers": POLYMERS,
+    "polymer_densities_g_cm3": POLYMER_DENSITIES_G_CM3.tolist(),
+    "polymer_alpha_prior": POLYMER_ALPHA_UNIFORM.tolist(),
+    "particle_size_range_um": [20.0, 50.0],
+    "hrf_per_scan": HRF_PER_SCAN,
+    "retina_mass_g": RETINA_MASS_G,
+    "model": "saturating binomial competition with hierarchical patient pooling",
+}
+with open(OUTDIR / "run_metadata.json", "w") as f:
+    json.dump(metadata, f, indent=2)
 
-plt.tight_layout()
-plt.savefig('Figure4_Density_Curves.png', dpi=300, bbox_inches='tight')
-print("\nFigure 4 saved: Figure4_Density_Curves.png")
-
-# ============================================================================
-# SAMPLE SIZE CALCULATION
-# ============================================================================
-
-print("\n")
-print("="*60)
-print("SAMPLE SIZE CALCULATION (Using Most Likely Scenario)")
-print("="*60)
-
-# Most Likely Scenario (DR)
-most_likely_median = 70.0
-p_mnp_in_hrf = most_likely_median / 100
-
-def samples_needed(p, confidence=0.95):
-    if p <= 0 or p >= 1:
-        return float('inf')
-    return np.log(1 - confidence) / np.log(1 - p)
-
-for confidence in [0.80, 0.90, 0.95]:
-    n = samples_needed(p_mnp_in_hrf, confidence)
-    if np.isfinite(n):
-        print(f"To be {confidence*100:.0f}% confident of detecting at least one MNP-containing HRF:")
-        print(f"  Need to sample approximately {int(np.ceil(n))} HRF")
-        print(f"  (Equivalent to {int(np.ceil(n))/20:.1f} OCT B-scans with ~20 HRF each)")
-    else:
-        print(f"To be {confidence*100:.0f}% confident: Sample size calculation invalid (p={p_mnp_in_hrf:.2f})")
-
-print("\n")
-print("="*60)
-print("SUMMARY")
-print("="*60)
-print("""
-KEY FINDINGS:
-
-1. Non-MNP HRF Baseline:
-   - Even in disease, some HRF are caused by lipofuscin, macrophages, etc.
-   - The simulation accounts for this competition
-
-2. Biologically Plausible Results:
-   - Healthy retina: Small minority of HRF may contain MNPs
-   - DR/AMD: Significant minority to majority may contain MNPs
-   - 95% CI provides realistic range of uncertainty
-
-3. Sample Size is Feasible:
-   - Approximately 2-3 HRF needed for 95% confidence under most likely scenario
-   - Conservative scenario may require more
-
-4. Sensitivity Analysis:
-   - Non-MNP baseline is the most influential parameter
-   - Optical match rate has modest influence
-   - MNP mass, spatial congruence, and HRF count show minimal influence
-   - This suggests that future empirical work should prioritize measuring the
-     non-MNP HRF baseline
-
-5. Next Steps:
-   - Empirically measure non-MNP HRF baseline in different disease states
-   - Conduct physical testing on targeted HRF
-   - Use results to calibrate and refine the simulation
-
-FIGURES GENERATED:
-   - Figure1_Base_Simulation.png: Bar chart with 95% CI for Healthy, DR, AMD
-   - Figure2_Scenario_Analysis.png: Comparison of Conservative, Most Likely, Optimistic
-   - Figure3_Tornado_Diagram.png: Sensitivity analysis showing parameter influence
-   - Figure4_Density_Curves.png: Probability density distributions (KDE)
-
-IMPORTANT NOTE:
-   - No random seed is set in this code.
-   - Results will vary slightly between runs due to random sampling.
-   - The values reported in the manuscript are from a specific simulation run,
-     recorded in Appendix B. Readers may obtain slightly different values
-     when running the code independently.
-""")
-
-print("\nAll figures saved successfully!")
+print("=" * 78)
+print("All outputs saved to:", OUTDIR.resolve())
+print("=" * 78)
 plt.show()
