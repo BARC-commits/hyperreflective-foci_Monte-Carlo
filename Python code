@@ -1,18 +1,3 @@
-# ============================================================================
-# MONTE CARLO SIMULATION: HRF ETIOLOGY AS COMPETITIVE PROCESS
-# ============================================================================
-# Model:
-#   - MP burden per retina -> Poisson particle count (truncated lognormal
-#     diameter, Dirichlet-sampled polymer composition density)
-#   - Spatial congruence and optical match (possibly correlated)
-#   - Hierarchical patient -> eyes -> HRF structure with optional
-#     overdispersion on HRF count
-#   - Per-HRF probability of MP association via saturating binomial
-#     competition:
-#         p = (1 - f) * (1 - exp(-potential / hrf_count))
-#     capped at the biological ceiling (1 - f)
-# ============================================================================
-
 import json
 from pathlib import Path
 
@@ -116,8 +101,15 @@ def simulate_competition(
     mixed_fraction=0.0,
     lower_um=20.0,
     upper_um=50.0,
+    polymer_alpha=None,
+    fixed_density=None,
 ):
-    density_arr = sample_polymer_density(rng, size)
+    # Polymer density is sampled from the specified composition prior unless
+    # a fixed density is explicitly requested for a sensitivity analysis.
+    if fixed_density is not None:
+        density_arr = np.full(size, float(fixed_density))
+    else:
+        density_arr = sample_polymer_density(rng, size, alpha=polymer_alpha)
     particle_count = particle_count_from_mass(
         rng, size, mp_mass_ug_g, density_arr, lower_um, upper_um
     )
@@ -135,7 +127,13 @@ def simulate_competition(
     if overdispersion > 0:
         b = rng.normal(0.0, overdispersion, size=size)
         lambda_eff = lambda_eff * np.exp(b)
-    hrf_count = np.maximum(rng.poisson(lam=lambda_eff), 1)
+    # The simulated cohort is conditional on having at least one identifiable HRF.
+    # Draw from a zero-truncated Poisson distribution; do not replace zeros with one.
+    hrf_count = rng.poisson(lam=lambda_eff)
+    zero_count = hrf_count == 0
+    while np.any(zero_count):
+        hrf_count[zero_count] = rng.poisson(lam=lambda_eff[zero_count])
+        zero_count = hrf_count == 0
 
     ceiling = 1.0 - non_mp_fraction
     supply_per_hrf = potential_total / hrf_count
@@ -143,6 +141,8 @@ def simulate_competition(
 
     mp_hrf = rng.binomial(hrf_count, p_mp)
     pct = 100.0 * mp_hrf / hrf_count
+    # Because HRF counts are zero-truncated, this is the probability of >=1
+    # MP-associated HRF conditional on a patient having at least one HRF.
     has_any = (mp_hrf >= 1)
 
     mixed = rng.binomial(hrf_count - mp_hrf, mixed_fraction)
@@ -171,8 +171,8 @@ def summarize(name, out, extra=None):
         "median_pct": float(np.median(pct)),
         "mean_pct": float(np.mean(pct)),
         "std_pct": float(np.std(pct)),
-        "pct_ci_lower": float(np.percentile(pct, 2.5)),
-        "pct_ci_upper": float(np.percentile(pct, 97.5)),
+        "pct_sim_interval_lower": float(np.percentile(pct, 2.5)),
+        "pct_sim_interval_upper": float(np.percentile(pct, 97.5)),
         "mean_p_mp_pct": float(np.mean(p_mp) * 100.0),
         "p_mp_ci_lower_pct": float(np.percentile(p_mp, 2.5) * 100.0),
         "p_mp_ci_upper_pct": float(np.percentile(p_mp, 97.5) * 100.0),
@@ -248,7 +248,7 @@ ax1.errorbar(x, meds,
              yerr=[[m - l for m, l in zip(meds, lo)],
                    [u - m for m, u in zip(meds, hi)]],
              fmt="none", capsize=8, color="black", linewidth=1.5,
-             label="95% CI")
+             label="95% simulation interval")
 ax1.scatter(x, means, marker="D", s=60, color="black", zorder=5, label="Mean")
 
 for xi, m, l, u, mu in zip(x, meds, lo, hi, means):
@@ -306,8 +306,8 @@ print()
 fig2, ax2 = plt.subplots(figsize=(9, 6))
 names = [r["name"] for r in scenario_rows]
 meds = [r["median_pct"] for r in scenario_rows]
-lo = [r["pct_ci_lower"] for r in scenario_rows]
-hi = [r["pct_ci_upper"] for r in scenario_rows]
+lo = [r["pct_sim_interval_lower"] for r in scenario_rows]
+hi = [r["pct_sim_interval_upper"] for r in scenario_rows]
 means = [r["mean_pct"] for r in scenario_rows]
 
 bars2 = ax2.bar(names, meds, color=["#f39c12", "#2ecc71", "#e74c3c"],
@@ -454,24 +454,18 @@ composition_priors = {
 comp_rows = []
 for name, alpha in composition_priors.items():
     if isinstance(alpha, str) and alpha == "fixed":
-        def sample_fixed(rng, size):
-            return np.full(size, 1.05)
+        out = simulate_competition(
+            RNG, N_SENSITIVITY, **BASE_DR, fixed_density=1.05
+        )
     else:
-        def sample_fixed(rng, size, _a=alpha):
-            w = rng.dirichlet(_a, size=size)
-            return w @ POLYMER_DENSITIES_G_CM3
-
-    original = sample_polymer_density
-    globals()["sample_polymer_density"] = sample_fixed
-    try:
-        out = simulate_competition(RNG, N_SENSITIVITY, **BASE_DR)
-        comp_rows.append(dict(
-            prior=name,
-            median=float(np.median(out["percentage"])),
-            mean_p_mp_pct=float(np.mean(out["p_mp"]) * 100.0),
-        ))
-    finally:
-        globals()["sample_polymer_density"] = original
+        out = simulate_competition(
+            RNG, N_SENSITIVITY, **BASE_DR, polymer_alpha=alpha
+        )
+    comp_rows.append(dict(
+        prior=name,
+        median=float(np.median(out["percentage"])),
+        mean_p_mp_pct=float(np.mean(out["p_mp"]) * 100.0),
+    ))
 
 comp_df = pd.DataFrame(comp_rows)
 comp_df.to_csv(OUTDIR / "polymer_composition_sensitivity.csv", index=False)
@@ -625,7 +619,8 @@ p_patient_conservative = float(np.mean(scenario_outputs["Conservative"]["has_any
 
 print(f"Per-HRF p(MP | HRF):  Most Likely = {p_hrf_most_likely:.4f}, "
       f"Conservative = {p_hrf_conservative:.4f}")
-print(f"Per-patient P(>=1 MP-HRF): Most Likely = {p_patient_most_likely:.4f}, "
+print("Patient-level probabilities are conditional on sampling an HRF-positive patient.")
+print(f"P(>=1 MP-associated HRF | HRF-positive patient): Most Likely = {p_patient_most_likely:.4f}, "
       f"Conservative = {p_patient_conservative:.4f}")
 print()
 
@@ -635,14 +630,16 @@ for scen_label, p_hrf, p_pat in [
     ("Conservative", p_hrf_conservative, p_patient_conservative),
 ]:
     for conf in [0.80, 0.90, 0.95]:
-        n_hrf = n_for(conf, p_hrf)
+        n_hrf_raw = n_for(conf, p_hrf)
         n_patient = n_for(conf, p_pat)
+        n_hrf_required = int(np.ceil(n_hrf_raw)) if np.isfinite(n_hrf_raw) else -1
         sample_rows.append(dict(
             scenario=scen_label,
             confidence=conf,
-            n_hrf=int(np.ceil(n_hrf)) if np.isfinite(n_hrf) else -1,
-            raw_scan_equiv=n_hrf / HRF_PER_SCAN if np.isfinite(n_hrf) else -1,
-            b_scans_ceiling=int(np.ceil(n_hrf / HRF_PER_SCAN)) if np.isfinite(n_hrf) else -1,
+            n_hrf=n_hrf_required,
+            raw_scan_equiv=(n_hrf_required / HRF_PER_SCAN) if n_hrf_required >= 0 else -1,
+            b_scans_ceiling=(int(np.ceil(n_hrf_required / HRF_PER_SCAN))
+                             if n_hrf_required >= 0 else -1),
             n_patients=int(np.ceil(n_patient)) if np.isfinite(n_patient) else -1,
         ))
 sample_df = pd.DataFrame(sample_rows)
@@ -662,13 +659,14 @@ cluster_rows = []
 for icc in [0.05, 0.10, 0.20]:
     for k in [5, 10, 20]:
         deff = 1.0 + (k - 1.0) * icc
-        n_ind = n_for(0.95, p_hrf_most_likely)
+        n_ind_raw = n_for(0.95, p_hrf_most_likely)
+        n_ind_required = int(np.ceil(n_ind_raw))
         cluster_rows.append(dict(
             icc=icc,
             hrf_per_cluster=k,
             design_effect=deff,
-            n_hrf_independent_95pct=int(np.ceil(n_ind)),
-            n_hrf_adjusted_95pct=int(np.ceil(n_ind * deff)),
+            n_hrf_independent_95pct=n_ind_required,
+            n_hrf_adjusted_95pct=int(np.ceil(n_ind_required * deff)),
         ))
 cluster_df = pd.DataFrame(cluster_rows)
 cluster_df.to_csv(OUTDIR / "clustering_sample_size_sensitivity.csv", index=False)
@@ -692,6 +690,10 @@ metadata = {
     "hrf_per_scan": HRF_PER_SCAN,
     "retina_mass_g": RETINA_MASS_G,
     "model": "saturating binomial competition with hierarchical patient pooling",
+    "hrf_count_sampling": "zero-truncated Poisson; cohort conditional on at least one identifiable HRF",
+    "interval_interpretation": "2.5th and 97.5th percentiles of simulated realised per-patient percentages",
+    "sample_size_scope": "nominal detection calculations only; not powered prevalence estimation or model validation",
+    "clustering_adjustment": "ceil(ceil(independent HRF requirement) * design effect)",
 }
 with open(OUTDIR / "run_metadata.json", "w") as f:
     json.dump(metadata, f, indent=2)
